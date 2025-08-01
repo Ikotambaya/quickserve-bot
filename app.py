@@ -1,180 +1,113 @@
-import os
-import json
-from flask import Flask, request, jsonify, render_template, redirect, url_for
+from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client
-from dotenv import load_dotenv
-from payment import create_paystack_payment, verify_paystack_payment
-from ai_helper import get_ai_recommendation
-from utils import estimate_eta_from_address
-import sqlite3
-import uuid
-
-load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY")
 
-# Twilio client setup
-twilio_client = Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+# Simple in-memory session store (phone -> state)
+user_sessions = {}
+# Store orders per user
+user_orders = {}
 
-# DB setup
-DB_PATH = "database.db"
+# Your Paystack payment link (replace this with your real Paystack payment URL)
+PAYSTACK_PAYMENT_URL = "https://paystack.com/pay/your-payment-link"
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS orders (
-        id TEXT PRIMARY KEY,
-        customer_number TEXT,
-        message TEXT,
-        ai_suggestion TEXT,
-        payment_ref TEXT,
-        payment_verified INTEGER DEFAULT 0,
-        delivery_method TEXT,
-        address TEXT,
-        eta TEXT,
-        status TEXT DEFAULT 'Pending'
-    )
-    """)
-    conn.commit()
-    conn.close()
+# Sample available items
+AVAILABLE_ITEMS = ['Pizza', 'Burger', 'Soda', 'Fries']
 
-init_db()
-
-# In-memory session store (for simplicity)
-sessions = {}
-
-@app.route("/whatsapp", methods=["POST"])
+@app.route('/whatsapp', methods=['POST'])
 def whatsapp_webhook():
-    sender = request.values.get("From", "")
-    body = request.values.get("Body", "").strip().lower()
+    incoming_msg = request.values.get('Body', '').strip().lower()
+    from_number = request.values.get('From', '')
     resp = MessagingResponse()
     msg = resp.message()
 
-    # Initialize session if not exists
-    if sender not in sessions:
-        sessions[sender] = {"stage": "greet"}
-    
-    session = sessions[sender]
+    # Get current user state or set default
+    state = user_sessions.get(from_number, 'start')
 
-    if session["stage"] == "greet":
-        msg.body("👋 Hello! Welcome to QuickServe. What kind of food are you craving today? Tell me a little about your taste or mood!")
-        session["stage"] = "waiting_for_preference"
-        return str(resp)
+    if state == 'start':
+        # Welcome and main menu
+        reply = ("Welcome to QuickServe! What would you like to do?\n"
+                 "1. Make Order\n"
+                 "2. Dispatch Rider\n"
+                 "Please reply with 1 or 2.")
+        msg.body(reply)
+        user_sessions[from_number] = 'menu'
 
-    elif session["stage"] == "waiting_for_preference":
-        # Get AI recommendation for menu
-        recommendation = get_ai_recommendation(body)
-        session["ai_suggestion"] = recommendation
-        session["stage"] = "awaiting_payment"
-        
-        # Create a unique order ID and payment link
-        order_id = str(uuid.uuid4())
-        payment_url = create_paystack_payment(order_id, 1500)  # Assuming flat NGN 1500 price; adjust as needed
-        
-        # Save partial order to DB (not verified yet)
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT INTO orders (id, customer_number, message, ai_suggestion) VALUES (?, ?, ?, ?)", 
-                  (order_id, sender, body, recommendation))
-        conn.commit()
-        conn.close()
+    elif state == 'menu':
+        if incoming_msg == '1':
+            # Show available items for order
+            items_list = "\n".join(f"{idx+1}. {item}" for idx, item in enumerate(AVAILABLE_ITEMS))
+            reply = ("Please select items by sending the item numbers separated by commas.\n"
+                     f"Available items:\n{items_list}\n\nExample: 1,3 for Pizza and Soda")
+            msg.body(reply)
+            user_sessions[from_number] = 'ordering'
 
-        msg.body(f"Here's what I recommend:\n\n{recommendation}\n\nTo confirm your order, please complete payment of ₦1500 here:\n{payment_url}\n\nReply 'PAID' once you complete payment.")
-        session["order_id"] = order_id
-        return str(resp)
+        elif incoming_msg == '2':
+            reply = "Dispatch rider feature coming soon! Reply with 'menu' to go back."
+            msg.body(reply)
+            # Keep user in menu state or reset to start?
+            user_sessions[from_number] = 'menu'
 
-    elif session["stage"] == "awaiting_payment":
-        if "paid" in body:
-            order_id = session.get("order_id")
-            if order_id and verify_paystack_payment(order_id):
-                # Mark payment verified in DB
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute("UPDATE orders SET payment_verified=1 WHERE id=?", (order_id,))
-                conn.commit()
-                conn.close()
+        elif incoming_msg == 'menu':
+            # Repeat menu
+            reply = ("Main Menu:\n1. Make Order\n2. Dispatch Rider\nPlease reply with 1 or 2.")
+            msg.body(reply)
 
-                msg.body("Payment confirmed! Would you like to pick up your order or have it delivered? Reply with 'pickup' or 'delivery'.")
-                session["stage"] = "awaiting_delivery_method"
-                return str(resp)
+        else:
+            msg.body("Invalid input. Please reply with 1 or 2.")
+
+    elif state == 'ordering':
+        # Parse selected items from user input
+        try:
+            selections = [int(x.strip()) for x in incoming_msg.split(',')]
+            selected_items = [AVAILABLE_ITEMS[i-1] for i in selections if 1 <= i <= len(AVAILABLE_ITEMS)]
+            if not selected_items:
+                msg.body("No valid items selected. Please try again.")
             else:
-                msg.body("Payment not confirmed yet. Please complete your payment at the link sent earlier, then reply 'PAID'.")
-                return str(resp)
+                user_orders[from_number] = selected_items
+                items_str = ', '.join(selected_items)
+                reply = (f"You selected: {items_str}\n"
+                         "Type 'pay' to proceed to payment or 'cancel' to cancel the order.")
+                msg.body(reply)
+                user_sessions[from_number] = 'payment'
+        except Exception:
+            msg.body("Invalid input format. Please send numbers separated by commas, e.g. 1,2")
+
+    elif state == 'payment':
+        if incoming_msg == 'pay':
+            # Send Paystack payment link
+            order_items = user_orders.get(from_number, [])
+            items_str = ', '.join(order_items)
+            reply = (f"Great! Please complete your payment for: {items_str}\n"
+                     f"Click here to pay: {PAYSTACK_PAYMENT_URL}\n\n"
+                     "After completing payment, reply with 'done'.")
+            msg.body(reply)
+            user_sessions[from_number] = 'awaiting_payment_confirmation'
+
+        elif incoming_msg == 'cancel':
+            user_orders.pop(from_number, None)
+            user_sessions[from_number] = 'start'
+            msg.body("Your order has been cancelled. Reply any message to start over.")
+
         else:
-            msg.body("Please reply with 'PAID' after completing payment.")
-            return str(resp)
+            msg.body("Please type 'pay' to proceed to payment or 'cancel' to cancel the order.")
 
-    elif session["stage"] == "awaiting_delivery_method":
-        if body in ["pickup", "delivery"]:
-            order_id = session.get("order_id")
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-
-            if body == "pickup":
-                c.execute("UPDATE orders SET delivery_method=?, status='Ready for Pickup' WHERE id=?", ("pickup", order_id))
-                conn.commit()
-                conn.close()
-                msg.body("Thanks! Your order will be ready for pickup in 30 minutes. We look forward to seeing you!")
-                sessions.pop(sender)
-                return str(resp)
-
-            elif body == "delivery":
-                c.execute("UPDATE orders SET delivery_method=? WHERE id=?", ("delivery", order_id))
-                conn.commit()
-                conn.close()
-                msg.body("Please provide your delivery address.")
-                session["stage"] = "awaiting_address"
-                return str(resp)
+    elif state == 'awaiting_payment_confirmation':
+        if incoming_msg == 'done':
+            msg.body("Thank you! Your payment is confirmed.\nYour order will be delivered in approx 30 minutes.")
+            # Clear session and order data
+            user_sessions.pop(from_number, None)
+            user_orders.pop(from_number, None)
         else:
-            msg.body("Reply with 'pickup' or 'delivery'.")
-            return str(resp)
-
-    elif session["stage"] == "awaiting_address":
-        order_id = session.get("order_id")
-        eta = estimate_eta_from_address(body)
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("UPDATE orders SET address=?, eta=?, status='Out for Delivery' WHERE id=?", (body, eta, order_id))
-        conn.commit()
-        conn.close()
-
-        msg.body(f"Thanks for your address! Your food will arrive in approximately {eta}. Enjoy your meal! 🍽️")
-        sessions.pop(sender)
-        return str(resp)
+            msg.body("Please reply 'done' after you complete the payment.")
 
     else:
-        msg.body("Sorry, I didn't understand that. Please start again.")
-        sessions.pop(sender, None)
-        return str(resp)
+        # Catch-all fallback
+        msg.body("Sorry, I didn't understand that. Reply 'menu' to see options.")
+        user_sessions[from_number] = 'start'
 
-@app.route("/paystack/webhook", methods=["POST"])
-def paystack_webhook():
-    # Paystack webhook to update payment verification status (optional)
-    payload = request.get_json()
-    event = payload.get("event")
-    data = payload.get("data", {})
-    order_id = data.get("metadata", {}).get("order_id")
+    return str(resp)
 
-    if event == "charge.success" and order_id:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("UPDATE orders SET payment_verified=1 WHERE id=?", (order_id,))
-        conn.commit()
-        conn.close()
-    return "OK", 200
 
-@app.route("/admin")
-def admin_dashboard():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, customer_number, message, ai_suggestion, payment_verified, delivery_method, address, eta, status FROM orders ORDER BY rowid DESC")
-    orders = c.fetchall()
-    conn.close()
-    return render_template("admin.html", orders=orders)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     app.run(port=8080, debug=True)
